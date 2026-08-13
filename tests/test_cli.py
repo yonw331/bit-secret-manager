@@ -34,14 +34,14 @@ class CliTestCase(unittest.TestCase):
         self.bws_data.write_text(
             json.dumps(
                 {
-                    "github-secret-id": {
-                        "id": "github-secret-id",
+                    "486c3235-2cb1-465d-9971-6997efdceb43": {
+                        "id": "486c3235-2cb1-465d-9971-6997efdceb43",
                         "key": "GITHUB_PAT",
                         "value": SECRET,
                         "revisionDate": "2026-08-12T00:00:00Z",
                     },
-                    "other-secret-id": {
-                        "id": "other-secret-id",
+                    "11111111-1111-4111-8111-111111111111": {
+                        "id": "11111111-1111-4111-8111-111111111111",
                         "key": "OTHER_SECRET",
                         "value": "other-profile-secret",
                         "revisionDate": "2026-08-12T00:00:00Z",
@@ -95,7 +95,7 @@ class CliTestCase(unittest.TestCase):
                     ttl_seconds: 604800
                     validator: none
                     secrets:
-                      - id: github-secret-id
+                      - id: 486c3235-2cb1-465d-9971-6997efdceb43
                         expected_key: GITHUB_PAT
                         env: GH_TOKEN
                         encoding: text
@@ -103,7 +103,7 @@ class CliTestCase(unittest.TestCase):
                     ttl_seconds: 604800
                     validator: none
                     secrets:
-                      - id: other-secret-id
+                      - id: 11111111-1111-4111-8111-111111111111
                         expected_key: OTHER_SECRET
                         env: OTHER_SECRET
                         encoding: text
@@ -317,6 +317,21 @@ class CliTestCase(unittest.TestCase):
 
         self.assertEqual(result.returncode, 2)
         self.assertIn("environment variable", result.stderr.lower())
+        self.assert_secret_absent(result)
+
+    def test_bws_secret_id_must_be_a_uuid(self):
+        config_text = self.config.read_text(encoding="utf-8")
+        config_text = config_text.replace(
+            "id: 486c3235-2cb1-465d-9971-6997efdceb43",
+            "id: bitwarden-server",
+            1,
+        )
+        self.config.write_text(config_text, encoding="utf-8")
+
+        result = self.run_cli("refresh", "github")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("secret id", result.stderr.lower())
         self.assert_secret_absent(result)
 
     def test_bws_provider_receives_bootstrap_token_but_not_other_managed_secrets(self):

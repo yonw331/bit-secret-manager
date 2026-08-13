@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 from typing import Any
+from uuid import UUID
 
 import yaml
 
@@ -121,6 +122,10 @@ def load_config(path: Path) -> dict[str, Any]:
                 raise HubError(f"profile {profile_name} has unsupported encoding", EXIT_CONFIG)
             if not all(isinstance(secret[key], str) and secret[key] for key in ("id", "expected_key", "env")):
                 raise HubError(f"profile {profile_name} has invalid secret mapping", EXIT_CONFIG)
+            try:
+                UUID(secret["id"])
+            except ValueError as exc:
+                raise HubError(f"profile {profile_name} has invalid BWS Secret ID", EXIT_CONFIG) from exc
             if not ENV_NAME_PATTERN.fullmatch(secret["env"]) or secret["env"] in RESERVED_ENV_NAMES:
                 raise HubError(f"profile {profile_name} has unsafe target environment variable", EXIT_CONFIG)
             if secret["env"] in profile_envs:
