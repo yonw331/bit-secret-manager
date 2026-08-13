@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "project_id": "replace-with-bws-project-id",
+  "config_repository": "https://github.com/example/private-config.git",
+  "config_repository_pat_secret_id": "replace-with-bws-secret-id"
+}
+

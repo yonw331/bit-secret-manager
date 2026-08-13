@@ -1,0 +1,15 @@
+schema_version: 1
+project_id: replace-with-bws-project-id
+state_dir: ~/configs
+token_file: ~/configs/bw.env
+bws_path: ~/.local/bin/bws
+gh_path: ~/.local/bin/gh
+profiles:
+  github:
+    ttl_seconds: 604800
+    validator: github
+    secrets:
+      - id: replace-with-bws-secret-id
+        expected_key: GITHUB_PAT
+        env: GH_TOKEN
+        encoding: text

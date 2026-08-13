@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.coverage
+/bw.env
+/cache/
+/audit/
+/tmp/
+/device.json
+
