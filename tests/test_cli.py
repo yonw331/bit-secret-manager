@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import tomllib
 import unittest
 from unittest import mock
 
@@ -127,7 +128,7 @@ class CliTestCase(unittest.TestCase):
             return []
         return [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
 
-    def test_version_is_0_1_0(self) -> None:
+    def test_version_is_0_2_0(self) -> None:
         result = subprocess.run(
             [sys.executable, "-m", "bit_secret_manager", "--version"],
             env=self.env,
@@ -136,7 +137,7 @@ class CliTestCase(unittest.TestCase):
             check=False,
         )
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(result.stdout.strip(), "bit-secret-manager 0.1.0")
+        self.assertEqual(result.stdout.strip(), "bit-secret-manager 0.2.0")
 
     def test_init_from_stdin_writes_raw_token_atomically(self) -> None:
         self.token.unlink()
@@ -147,11 +148,353 @@ class CliTestCase(unittest.TestCase):
         self.assertNotIn(TOKEN, result.stdout + result.stderr)
         self.assertEqual(list(self.config_dir.glob(".access-token.*")), [])
 
+    def test_init_from_stdin_requires_existing_config(self) -> None:
+        self.config.unlink()
+        self.token.unlink()
+        self.config_dir.rmdir()
+
+        result = self.run_cli("init", "--token-stdin", input_text=TOKEN + "\n")
+
+        self.assertEqual(result.returncode, cli.EXIT_CONFIG)
+        self.assertIn("non-interactive init requires an existing configuration", result.stderr)
+        self.assertFalse(self.config_dir.exists())
+        self.assertNotIn(TOKEN, result.stdout + result.stderr)
+
+    def test_interactive_init_bootstraps_single_mapping(self) -> None:
+        self.config.unlink()
+        self.token.unlink()
+        self.config_dir.rmdir()
+        answers = "\n".join(
+            [
+                "github",
+                ID_ONE,
+                "GITHUB_PAT",
+                "GH_TOKEN",
+                "n",
+                "n",
+                TOKEN,
+            ]
+        )
+
+        result = self.run_cli("init", input_text=answers + "\n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with self.config.open("rb") as handle:
+            config = tomllib.load(handle)
+        self.assertEqual(
+            config,
+            {
+                "schema_version": 1,
+                "profiles": {
+                    "github": [{"id": ID_ONE, "expected_key": "GITHUB_PAT", "env": "GH_TOKEN"}]
+                },
+            },
+        )
+        self.assertEqual(stat.S_IMODE(self.config_dir.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(self.config.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.token.stat().st_mode), 0o600)
+        self.assertEqual(self.token.read_text(encoding="utf-8"), TOKEN + "\n")
+        self.assertNotIn(TOKEN, result.stdout + result.stderr)
+
+    def test_interactive_init_reprompts_invalid_uuid(self) -> None:
+        self.config.unlink()
+        self.token.unlink()
+        self.config_dir.rmdir()
+        answers = "\n".join(
+            ["github", "not-a-uuid", ID_ONE, "GITHUB_PAT", "GH_TOKEN", "n", "n", TOKEN]
+        )
+
+        result = self.run_cli("init", input_text=answers + "\n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Secret ID must be a UUID", result.stderr)
+        self.assertNotIn("not-a-uuid", result.stdout + result.stderr)
+
+    def test_interactive_init_reprompts_expected_key_equal_to_uuid(self) -> None:
+        self.config.unlink()
+        self.token.unlink()
+        self.config_dir.rmdir()
+        answers = "\n".join(
+            ["github", ID_ONE, ID_ONE, "GITHUB_PAT", "GH_TOKEN", "n", "n", TOKEN]
+        )
+
+        result = self.run_cli("init", input_text=answers + "\n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("expected key must differ from the Secret UUID", result.stderr)
+        with self.config.open("rb") as handle:
+            config = tomllib.load(handle)
+        self.assertEqual(config["profiles"]["github"][0]["expected_key"], "GITHUB_PAT")
+        self.assertNotIn(TOKEN, result.stdout + result.stderr)
+
+    def test_interactive_init_reprompts_non_utf8_expected_key(self) -> None:
+        self.config.unlink()
+        self.token.unlink()
+        self.config_dir.rmdir()
+        answers = b"\n".join(
+            [
+                b"github",
+                ID_ONE.encode(),
+                b"GITHUB_TOKEN\xe2",
+                b"GITHUB_TOKEN",
+                b"GITHUB_TOKEN",
+                b"n",
+                b"n",
+                TOKEN.encode(),
+            ]
+        )
+
+        result = subprocess.run(
+            [sys.executable, "-m", "bit_secret_manager", "--config", str(self.config), "init"],
+            input=answers + b"\n",
+            env=self.env,
+            capture_output=True,
+            check=False,
+        )
+
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        self.assertEqual(result.returncode, 0, stderr)
+        self.assertIn("input must be valid UTF-8", stderr)
+        self.assertNotIn("Traceback", stderr)
+        with self.config.open("rb") as handle:
+            config = tomllib.load(handle)
+        self.assertEqual(config["profiles"]["github"][0]["expected_key"], "GITHUB_TOKEN")
+
+    def test_interactive_init_cancellation_before_token_keeps_zero_state(self) -> None:
+        self.config.unlink()
+        self.token.unlink()
+        self.config_dir.rmdir()
+        answers = "\n".join(["github", ID_ONE, "GITHUB_PAT", "GH_TOKEN", "n", "n"])
+
+        result = self.run_cli("init", input_text=answers + "\n")
+
+        self.assertEqual(result.returncode, cli.EXIT_CONFIG)
+        self.assertIn("initialization cancelled", result.stderr)
+        self.assertFalse(self.config_dir.exists())
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_interactive_init_serializes_dotted_profile_name(self) -> None:
+        self.config.unlink()
+        self.token.unlink()
+        self.config_dir.rmdir()
+        answers = "\n".join(
+            ["team.github", ID_ONE, "GITHUB_PAT", "GH_TOKEN", "n", "n", TOKEN]
+        )
+
+        result = self.run_cli("init", input_text=answers + "\n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with self.config.open("rb") as handle:
+            config = tomllib.load(handle)
+        self.assertEqual(set(config["profiles"]), {"team.github"})
+
+    def test_interactive_init_adds_multiple_mappings_to_one_profile(self) -> None:
+        self.config.unlink()
+        self.token.unlink()
+        self.config_dir.rmdir()
+        answers = "\n".join(
+            [
+                "github",
+                ID_ONE,
+                "GITHUB_PAT",
+                "GH_TOKEN",
+                "y",
+                ID_TWO,
+                "SECOND_PAT",
+                "SECOND_TOKEN",
+                "n",
+                "n",
+                TOKEN,
+            ]
+        )
+
+        result = self.run_cli("init", input_text=answers + "\n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with self.config.open("rb") as handle:
+            config = tomllib.load(handle)
+        self.assertEqual(
+            config["profiles"]["github"],
+            [
+                {"id": ID_ONE, "expected_key": "GITHUB_PAT", "env": "GH_TOKEN"},
+                {"id": ID_TWO, "expected_key": "SECOND_PAT", "env": "SECOND_TOKEN"},
+            ],
+        )
+        self.assertEqual(self.token.read_text(encoding="utf-8"), TOKEN + "\n")
+        self.assertNotIn(TOKEN, result.stdout + result.stderr)
+
+    def test_interactive_init_reprompts_duplicate_profile_environment(self) -> None:
+        self.config.unlink()
+        self.token.unlink()
+        self.config_dir.rmdir()
+        answers = "\n".join(
+            [
+                "github",
+                ID_ONE,
+                "GITHUB_PAT",
+                "GH_TOKEN",
+                "y",
+                ID_TWO,
+                "SECOND_PAT",
+                "GH_TOKEN",
+                "SECOND_TOKEN",
+                "n",
+                "n",
+                TOKEN,
+            ]
+        )
+
+        result = self.run_cli("init", input_text=answers + "\n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("environment variable is unsafe or already used", result.stderr)
+        with self.config.open("rb") as handle:
+            config = tomllib.load(handle)
+        self.assertEqual(
+            [mapping["env"] for mapping in config["profiles"]["github"]],
+            ["GH_TOKEN", "SECOND_TOKEN"],
+        )
+        self.assertNotIn(TOKEN, result.stdout + result.stderr)
+
+    def test_interactive_init_adds_multiple_profiles(self) -> None:
+        self.config.unlink()
+        self.token.unlink()
+        self.config_dir.rmdir()
+        answers = "\n".join(
+            [
+                "github",
+                ID_ONE,
+                "GITHUB_PAT",
+                "GH_TOKEN",
+                "n",
+                "y",
+                "other",
+                ID_TWO,
+                "SECOND_PAT",
+                "OTHER_TOKEN",
+                "n",
+                "n",
+                TOKEN,
+            ]
+        )
+
+        result = self.run_cli("init", input_text=answers + "\n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with self.config.open("rb") as handle:
+            config = tomllib.load(handle)
+        self.assertEqual(
+            config["profiles"],
+            {
+                "github": [{"id": ID_ONE, "expected_key": "GITHUB_PAT", "env": "GH_TOKEN"}],
+                "other": [{"id": ID_TWO, "expected_key": "SECOND_PAT", "env": "OTHER_TOKEN"}],
+            },
+        )
+        self.assertNotIn(TOKEN, result.stdout + result.stderr)
+
+    def test_interactive_init_reprompts_duplicate_profile_name(self) -> None:
+        self.config.unlink()
+        self.token.unlink()
+        self.config_dir.rmdir()
+        answers = "\n".join(
+            [
+                "github",
+                ID_ONE,
+                "GITHUB_PAT",
+                "GH_TOKEN",
+                "n",
+                "y",
+                "github",
+                "other",
+                ID_TWO,
+                "SECOND_PAT",
+                "OTHER_TOKEN",
+                "n",
+                "n",
+                TOKEN,
+            ]
+        )
+
+        result = self.run_cli("init", input_text=answers + "\n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("profile name is unsafe or already exists", result.stderr)
+        with self.config.open("rb") as handle:
+            config = tomllib.load(handle)
+        self.assertEqual(set(config["profiles"]), {"github", "other"})
+        self.assertNotIn(TOKEN, result.stdout + result.stderr)
+
+    def test_interactive_init_rejects_symlinked_missing_config_directory_before_prompt(self) -> None:
+        self.config.unlink()
+        self.token.unlink()
+        self.config_dir.rmdir()
+        target = self.root / "outside-config"
+        target.mkdir(mode=0o700)
+        self.config_dir.symlink_to(target, target_is_directory=True)
+
+        result = self.run_cli("init", input_text="")
+
+        self.assertEqual(result.returncode, cli.EXIT_PERMISSION)
+        self.assertIn("configuration directory may not be a symbolic link", result.stderr)
+        self.assertNotIn("Profile name", result.stdout + result.stderr)
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_interactive_init_rolls_back_config_when_token_write_fails(self) -> None:
+        self.config.unlink()
+        self.token.unlink()
+        self.token.mkdir(mode=0o700)
+        answers = "\n".join(
+            ["github", ID_ONE, "GITHUB_PAT", "GH_TOKEN", "n", "n", TOKEN]
+        )
+
+        result = self.run_cli("init", input_text=answers + "\n")
+
+        self.assertEqual(result.returncode, cli.EXIT_PERMISSION)
+        self.assertFalse(self.config.exists())
+        self.assertTrue(self.token.is_dir())
+        self.assertEqual(list(self.config_dir.glob(".config.toml.*")), [])
+        self.assertEqual(list(self.config_dir.glob(".access-token.*")), [])
+        self.assertNotIn(TOKEN, result.stdout + result.stderr)
+
     def test_init_rejects_multiple_stdin_lines_without_writing(self) -> None:
         self.token.unlink()
         result = self.run_cli("init", "--token-stdin", input_text="one\ntwo\n")
         self.assertEqual(result.returncode, cli.EXIT_CONFIG)
         self.assertFalse(self.token.exists())
+
+    def test_init_rejects_a_token_pasted_twice_without_overwriting(self) -> None:
+        original = self.token.read_bytes()
+
+        result = self.run_cli("init", "--token-stdin", input_text=TOKEN + TOKEN + "\n")
+
+        self.assertEqual(result.returncode, cli.EXIT_CONFIG)
+        self.assertIn("Token appears to be duplicated", result.stderr)
+        self.assertEqual(self.token.read_bytes(), original)
+        self.assertNotIn(TOKEN, result.stdout + result.stderr)
+
+    def test_init_rejects_non_utf8_token_without_overwriting(self) -> None:
+        original = self.token.read_bytes()
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "bit_secret_manager",
+                "--config",
+                str(self.config),
+                "init",
+            ],
+            input=b"invalid-token-\xe2\n",
+            env=self.env,
+            capture_output=True,
+            check=False,
+        )
+
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        self.assertEqual(result.returncode, cli.EXIT_CONFIG)
+        self.assertIn("Token must be valid UTF-8", stderr)
+        self.assertNotIn("Traceback", stderr)
+        self.assertEqual(self.token.read_bytes(), original)
 
     def test_init_uses_hidden_input(self) -> None:
         self.token.unlink()
@@ -159,6 +502,17 @@ class CliTestCase(unittest.TestCase):
             result = cli.main(["--config", str(self.config), "init"])
         self.assertEqual(result, 0)
         self.assertEqual(self.token.read_text(encoding="utf-8"), TOKEN + "\n")
+
+    def test_interactive_init_with_existing_config_preserves_config_bytes(self) -> None:
+        original = self.config.read_bytes()
+        self.token.unlink()
+
+        result = self.run_cli("init", input_text=TOKEN + "\n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.config.read_bytes(), original)
+        self.assertEqual(self.token.read_text(encoding="utf-8"), TOKEN + "\n")
+        self.assertNotIn(TOKEN, result.stdout + result.stderr)
 
     def test_init_refuses_token_symlink(self) -> None:
         self.token.unlink()
@@ -331,7 +685,7 @@ class InstallerTestCase(unittest.TestCase):
                 text=True,
                 check=False,
             )
-            self.assertEqual(smoke.stdout.strip(), "bit-secret-manager 0.1.0")
+            self.assertEqual(smoke.stdout.strip(), "bit-secret-manager 0.2.0")
 
 
 if __name__ == "__main__":

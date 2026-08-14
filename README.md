@@ -24,13 +24,24 @@ scope or remove its single-compromise blast radius.
 bit-secret-manager --version
 ```
 
-The installer only copies the manager into `~/.local`. It does not install
-Python, `bws`, edit shell startup files, or create credentials.
+The installer places the executable launcher at
+`~/.local/bin/bit-secret-manager` and the Python package under
+`~/.local/lib/bit-secret-manager`. The library directory is not an executable.
+It does not install Python or `bws`, edit shell startup files, or create
+credentials.
 
 ## Configure
 
-Create `~/.config/bit-secret-manager/config.toml` with directory mode `0700`
-and file mode `0600`:
+On first use, run the interactive initializer:
+
+```bash
+bit-secret-manager init
+```
+
+It collects one or more profiles and mappings, then prompts for the BWS Machine
+Account Token using hidden input. It creates
+`~/.config/bit-secret-manager/config.toml` with directory mode `0700` and file
+mode `0600`. The resulting non-secret configuration has this shape:
 
 ```toml
 schema_version = 1
@@ -41,16 +52,19 @@ expected_key = "GITHUB_PAT"
 env = "GH_TOKEN"
 ```
 
-Only Secret IDs, expected BWS keys, and target environment names belong in the
-configuration. Initialize this machine without putting its Token in argv:
+Only Secret IDs, expected BWS keys, profile names, and target environment names
+belong in the configuration. The Token is stored separately with mode `0600`.
+Verify the initialized profiles:
 
 ```bash
-bit-secret-manager init
 bit-secret-manager doctor
 ```
 
-For a trusted pipe, `init --token-stdin` reads exactly one line. The Token is
-stored as raw text in `access-token`; it is not a shell-sourceable file.
+When a valid configuration already exists, `init` only initializes or rotates
+the Token and preserves the configuration bytes. For a trusted pipe,
+`init --token-stdin` reads exactly one line and also requires an existing valid
+configuration. The Token is stored as raw text in `access-token`; it is not a
+shell-sourceable file.
 
 Run consumers with an argv, not a shell string:
 
