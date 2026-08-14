@@ -1,476 +1,337 @@
 from __future__ import annotations
 
-import hashlib
+import getpass
 import json
 import os
 from pathlib import Path
-import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
+
+from bit_secret_manager import cli
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SECRET = "prototype-secret-value"
-BWS_TOKEN = "prototype-bws-access-token"
+ID_ONE = "11111111-1111-4111-8111-111111111111"
+ID_TWO = "22222222-2222-4222-8222-222222222222"
+TOKEN = "test-machine-token"
+SECRET_ONE = "value-never-print-one"
+SECRET_TWO = "value-never-print-two"
 
 
 class CliTestCase(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp_dir.name)
-        self.state_dir = self.root / "state"
+        self.temp = tempfile.TemporaryDirectory(dir="/tmp")
+        self.root = Path(self.temp.name)
+        self.config_dir = self.root / "config"
+        self.config_dir.mkdir(mode=0o700)
+        self.config = self.config_dir / "config.toml"
+        self.write_config()
+        self.token = self.config_dir / "access-token"
+        self.write_private(self.token, TOKEN + "\n")
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()
-        self.token_file = self.root / "bw.env"
-        self.token_file.write_text(
-            f"BWS_ACCESS_TOKEN={BWS_TOKEN}\n", encoding="utf-8"
-        )
-        self.token_file.chmod(0o600)
-        self.bws_data = self.root / "bws-data.json"
-        self.bws_data.write_text(
-            json.dumps(
-                {
-                    "486c3235-2cb1-465d-9971-6997efdceb43": {
-                        "id": "486c3235-2cb1-465d-9971-6997efdceb43",
-                        "key": "GITHUB_PAT",
-                        "value": SECRET,
-                        "revisionDate": "2026-08-12T00:00:00Z",
-                    },
-                    "11111111-1111-4111-8111-111111111111": {
-                        "id": "11111111-1111-4111-8111-111111111111",
-                        "key": "OTHER_SECRET",
-                        "value": "other-profile-secret",
-                        "revisionDate": "2026-08-12T00:00:00Z",
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
-        self.bws_unavailable = self.root / "bws-unavailable"
-        self.fake_bws = self.bin_dir / "bws"
-        self.fake_bws.write_text(
-            textwrap.dedent(
-                f"""\
-                #!/usr/bin/env python3
-                import json
-                import os
-                from pathlib import Path
-                import sys
-
-                if os.environ.get("BWS_ACCESS_TOKEN") != {BWS_TOKEN!r}:
-                    print("authentication failed", file=sys.stderr)
-                    raise SystemExit(4)
-                if "OTHER_SECRET" in os.environ:
-                    print("managed secret leaked into provider", file=sys.stderr)
-                    raise SystemExit(8)
-                if Path({str(self.bws_unavailable)!r}).exists():
-                    print("service unavailable", file=sys.stderr)
-                    raise SystemExit(9)
-                secret_id = sys.argv[3]
-                data = json.loads(Path({str(self.bws_data)!r}).read_text())
-                if secret_id not in data:
-                    print("secret not found", file=sys.stderr)
-                    raise SystemExit(5)
-                print(json.dumps(data[secret_id]))
-                """
-            ),
-            encoding="utf-8",
-        )
-        self.fake_bws.chmod(0o700)
-        self.config = self.root / "config.yaml"
-        self.config.write_text(
-            textwrap.dedent(
-                f"""\
-                schema_version: 1
-                project_id: prototype-project
-                state_dir: {self.state_dir}
-                token_file: {self.token_file}
-                bws_path: {self.fake_bws}
-                profiles:
-                  github:
-                    ttl_seconds: 604800
-                    validator: none
-                    secrets:
-                      - id: 486c3235-2cb1-465d-9971-6997efdceb43
-                        expected_key: GITHUB_PAT
-                        env: GH_TOKEN
-                        encoding: text
-                  other:
-                    ttl_seconds: 604800
-                    validator: none
-                    secrets:
-                      - id: 11111111-1111-4111-8111-111111111111
-                        expected_key: OTHER_SECRET
-                        env: OTHER_SECRET
-                        encoding: text
-                """
-            ),
-            encoding="utf-8",
-        )
-        self.fake_gh_log = self.root / "fake-gh-argv.json"
-        self.fake_gh = self.bin_dir / "gh"
-        self.fake_gh.write_text(
-            textwrap.dedent(
-                """\
-                #!/usr/bin/env python3
-                import json
-                import os
-                from pathlib import Path
-                import sys
-
-                Path(os.environ["FAKE_GH_LOG"]).write_text(json.dumps(sys.argv[1:]))
-                if sys.argv[1:3] == ["api", "user"]:
-                    if os.environ.get("GH_TOKEN") == "prototype-secret-value":
-                        print('{"login":"prototype-user"}')
-                        raise SystemExit(0)
-                    raise SystemExit(4)
-                if sys.argv[1:3] == ["auth", "setup-git"]:
-                    raise SystemExit(0)
-                raise SystemExit(3)
-                """
-            ),
-            encoding="utf-8",
-        )
-        self.fake_gh.chmod(0o700)
-        self.base_env = os.environ.copy()
-        self.base_env.update(
-            {
-                "PYTHONPATH": str(PROJECT_ROOT),
-                "FAKE_GH_LOG": str(self.fake_gh_log),
-            }
-        )
+        self.bws = self.bin_dir / "bws"
+        self.state = self.bin_dir / "fake-bws.json"
+        self.log = self.bin_dir / "calls.jsonl"
+        self.write_fake_bws()
+        self.write_state()
+        self.env = os.environ.copy()
+        self.env["PATH"] = f"{self.bin_dir}{os.pathsep}{self.env.get('PATH', '')}"
+        self.env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
 
     def tearDown(self) -> None:
-        self.temp_dir.cleanup()
+        self.temp.cleanup()
 
-    def run_cli(self, *args: str, env: dict[str, str] | None = None):
-        command = [
-            sys.executable,
-            "-m",
-            "bit_secret_hub",
-            "--config",
-            str(self.config),
-            *args,
-        ]
+    def write_private(self, path: Path, content: str) -> None:
+        path.write_text(content, encoding="utf-8")
+        path.chmod(0o600)
+
+    def write_config(self, content: str | None = None) -> None:
+        if content is None:
+            content = textwrap.dedent(
+                f"""\
+                schema_version = 1
+
+                [[profiles.github]]
+                id = "{ID_ONE}"
+                expected_key = "GITHUB_PAT"
+                env = "GH_TOKEN"
+
+                [[profiles.github]]
+                id = "{ID_TWO}"
+                expected_key = "SECOND_PAT"
+                env = "SECOND_TOKEN"
+
+                [[profiles.other]]
+                id = "{ID_TWO}"
+                expected_key = "SECOND_PAT"
+                env = "OTHER_TOKEN"
+                """
+            )
+        self.write_private(self.config, content)
+
+    def write_state(self, *, token: str = TOKEN, records: dict[str, dict[str, str]] | None = None) -> None:
+        if records is None:
+            records = {
+                ID_ONE: {"id": ID_ONE, "key": "GITHUB_PAT", "value": SECRET_ONE},
+                ID_TWO: {"id": ID_TWO, "key": "SECOND_PAT", "value": SECRET_TWO},
+            }
+        self.state.write_text(json.dumps({"token": token, "records": records}), encoding="utf-8")
+
+    def write_fake_bws(self) -> None:
+        script = textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            import json
+            import os
+            from pathlib import Path
+            import sys
+
+            root = Path(__file__).resolve().parent
+            state = json.loads((root / "fake-bws.json").read_text())
+            with (root / "calls.jsonl").open("a") as handle:
+                handle.write(json.dumps({"argv": sys.argv[1:], "env_names": sorted(os.environ)}) + "\\n")
+            if os.environ.get("BWS_ACCESS_TOKEN") != state["token"]:
+                sys.exit(1)
+            if sys.argv[1:] == ["secret", "list"]:
+                print("[]")
+                sys.exit(0)
+            if len(sys.argv) == 4 and sys.argv[1:3] == ["secret", "get"]:
+                record = state["records"].get(sys.argv[3])
+                if record is None:
+                    sys.exit(5)
+                print(json.dumps(record))
+                sys.exit(0)
+            sys.exit(2)
+            """
+        )
+        self.bws.write_text(script, encoding="utf-8")
+        self.bws.chmod(0o755)
+
+    def run_cli(self, *args: str, input_text: str | None = None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            command,
-            cwd=PROJECT_ROOT,
-            env=env or self.base_env,
+            [sys.executable, "-m", "bit_secret_manager", "--config", str(self.config), *args],
+            input=input_text,
+            env=env or self.env,
             capture_output=True,
             text=True,
             check=False,
         )
 
-    def assert_secret_absent(self, result: subprocess.CompletedProcess[str]) -> None:
+    def calls(self) -> list[dict[str, object]]:
+        if not self.log.exists():
+            return []
+        return [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
+
+    def test_version_is_0_1_0(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-m", "bit_secret_manager", "--version"],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.strip(), "bit-secret-manager 0.1.0")
+
+    def test_init_from_stdin_writes_raw_token_atomically(self) -> None:
+        self.token.unlink()
+        result = self.run_cli("init", "--token-stdin", input_text=TOKEN + "\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.token.read_text(encoding="utf-8"), TOKEN + "\n")
+        self.assertEqual(stat.S_IMODE(self.token.stat().st_mode), 0o600)
+        self.assertNotIn(TOKEN, result.stdout + result.stderr)
+        self.assertEqual(list(self.config_dir.glob(".access-token.*")), [])
+
+    def test_init_rejects_multiple_stdin_lines_without_writing(self) -> None:
+        self.token.unlink()
+        result = self.run_cli("init", "--token-stdin", input_text="one\ntwo\n")
+        self.assertEqual(result.returncode, cli.EXIT_CONFIG)
+        self.assertFalse(self.token.exists())
+
+    def test_init_uses_hidden_input(self) -> None:
+        self.token.unlink()
+        with mock.patch.object(getpass, "getpass", return_value=TOKEN):
+            result = cli.main(["--config", str(self.config), "init"])
+        self.assertEqual(result, 0)
+        self.assertEqual(self.token.read_text(encoding="utf-8"), TOKEN + "\n")
+
+    def test_init_refuses_token_symlink(self) -> None:
+        self.token.unlink()
+        target = self.root / "outside"
+        target.write_text("unchanged", encoding="utf-8")
+        self.token.symlink_to(target)
+        result = self.run_cli("init", "--token-stdin", input_text=TOKEN + "\n")
+        self.assertEqual(result.returncode, cli.EXIT_PERMISSION)
+        self.assertEqual(target.read_text(encoding="utf-8"), "unchanged")
+
+    def test_doctor_checks_authentication_and_every_identity(self) -> None:
+        result = self.run_cli("doctor")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("authentication: ok", result.stdout)
+        self.assertIn("profile.github.GITHUB_PAT: ok", result.stdout)
+        self.assertIn("profile.other.SECOND_PAT: ok", result.stdout)
         combined = result.stdout + result.stderr
-        self.assertNotIn(SECRET, combined)
-        self.assertNotIn(BWS_TOKEN, combined)
+        for forbidden in (TOKEN, SECRET_ONE, SECRET_TWO, ID_ONE, ID_TWO):
+            self.assertNotIn(forbidden, combined)
 
-    def test_refresh_writes_private_profile_cache_without_printing_secrets(self):
-        result = self.run_cli("refresh", "github")
+    def test_doctor_reports_auth_failure_without_provider_output(self) -> None:
+        self.write_state(token="different-token")
+        result = self.run_cli("doctor")
+        self.assertEqual(result.returncode, cli.EXIT_REMOTE)
+        self.assertIn("authentication: failed", result.stderr)
+        self.assertNotIn(TOKEN, result.stdout + result.stderr)
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assert_secret_absent(result)
-        cache_file = self.state_dir / "cache" / "github.json"
-        self.assertTrue(cache_file.exists())
-        self.assertEqual(stat.S_IMODE(cache_file.stat().st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(self.state_dir.stat().st_mode), 0o700)
+    def test_doctor_reports_missing_bws(self) -> None:
+        env = self.env.copy()
+        env["PATH"] = "/nonexistent"
+        result = self.run_cli("doctor", env=env)
+        self.assertEqual(result.returncode, cli.EXIT_REMOTE)
+        self.assertIn("bws: missing", result.stderr)
 
-        cache = json.loads(cache_file.read_text(encoding="utf-8"))
-        self.assertNotIn(SECRET, cache_file.read_text(encoding="utf-8"))
-        self.assertEqual(cache["values"]["GH_TOKEN"], "cHJvdG90eXBlLXNlY3JldC12YWx1ZQ==")
-        self.assertRegex(cache["content_sha256"], r"^[0-9a-f]{64}$")
-        self.assertEqual(cache["status"], "verified")
-
-    def test_status_json_contains_metadata_but_no_secret(self):
-        self.assertEqual(self.run_cli("refresh", "github").returncode, 0)
-
-        result = self.run_cli("status", "github", "--json")
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assert_secret_absent(result)
-        payload = json.loads(result.stdout)
-        self.assertEqual(payload["profile"], "github")
-        self.assertEqual(payload["status"], "ready")
-        self.assertIn("expires_at", payload)
-
-    def test_exec_injects_selected_profile_and_removes_managed_and_bootstrap_values(self):
-        self.assertEqual(self.run_cli("refresh", "github").returncode, 0)
-        self.assertEqual(self.run_cli("refresh", "other").returncode, 0)
-        observation = self.root / "child.json"
-        child = self.root / "observe.py"
-        child.write_text(
-            textwrap.dedent(
-                """\
-                import hashlib
-                import json
-                import os
-                from pathlib import Path
-                import sys
-
-                payload = {
-                    "gh_hash": hashlib.sha256(os.environ["GH_TOKEN"].encode()).hexdigest(),
-                    "has_other": "OTHER_SECRET" in os.environ,
-                    "has_bws": "BWS_ACCESS_TOKEN" in os.environ,
-                }
-                Path(sys.argv[1]).write_text(json.dumps(payload))
-                """
-            ),
+    def test_run_fetches_profile_then_preserves_argv_and_exit_code(self) -> None:
+        target = self.root / "target.py"
+        output = self.root / "target.json"
+        target.write_text(
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "Path(sys.argv[1]).write_text(json.dumps({'argv': sys.argv[2:], 'gh': os.getenv('GH_TOKEN'), "
+            "'second': os.getenv('SECOND_TOKEN'), 'other': os.getenv('OTHER_TOKEN'), "
+            "'bws': os.getenv('BWS_ACCESS_TOKEN')}))\n"
+            "raise SystemExit(37)\n",
             encoding="utf-8",
         )
-        env = self.base_env.copy()
-        env.update(
-            {
-                "GH_TOKEN": "stale-value",
-                "OTHER_SECRET": "stale-other",
-                "BWS_ACCESS_TOKEN": "stale-bootstrap",
-            }
-        )
-
+        env = self.env.copy()
+        env.update({"BWS_ACCESS_TOKEN": "parent-token", "GH_TOKEN": "stale", "OTHER_TOKEN": "stale-other"})
         result = self.run_cli(
-            "exec", "github", "--offline", "--", sys.executable, str(child), str(observation), env=env
+            "run", "github", "--", sys.executable, str(target), str(output), "space value", "$(literal)", env=env
         )
+        self.assertEqual(result.returncode, 37, result.stderr)
+        observed = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(observed["argv"], ["space value", "$(literal)"])
+        self.assertEqual(observed["gh"], SECRET_ONE)
+        self.assertEqual(observed["second"], SECRET_TWO)
+        self.assertIsNone(observed["other"])
+        self.assertIsNone(observed["bws"])
+        self.assertNotIn(SECRET_ONE, result.stdout + result.stderr)
 
+    def test_run_is_profile_atomic_when_later_secret_fails(self) -> None:
+        marker = self.root / "started"
+        records = {ID_ONE: {"id": ID_ONE, "key": "GITHUB_PAT", "value": SECRET_ONE}}
+        self.write_state(records=records)
+        result = self.run_cli("run", "github", "--", sys.executable, "-c", f"open({str(marker)!r}, 'w').close()")
+        self.assertEqual(result.returncode, cli.EXIT_REMOTE)
+        self.assertFalse(marker.exists())
+        self.assertNotIn(SECRET_ONE, result.stdout + result.stderr)
+
+    def test_run_rejects_identity_mismatch_before_launch(self) -> None:
+        marker = self.root / "started"
+        records = {
+            ID_ONE: {"id": ID_ONE, "key": "WRONG", "value": SECRET_ONE},
+            ID_TWO: {"id": ID_TWO, "key": "SECOND_PAT", "value": SECRET_TWO},
+        }
+        self.write_state(records=records)
+        result = self.run_cli("run", "github", "--", sys.executable, "-c", f"open({str(marker)!r}, 'w').close()")
+        self.assertEqual(result.returncode, cli.EXIT_REMOTE)
+        self.assertFalse(marker.exists())
+
+    def test_bws_receives_only_minimal_environment(self) -> None:
+        env = self.env.copy()
+        env["UNRELATED_SECRET"] = "must-not-reach-provider"
+        result = self.run_cli("doctor", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assert_secret_absent(result)
-        payload = json.loads(observation.read_text(encoding="utf-8"))
-        self.assertEqual(payload["gh_hash"], hashlib.sha256(SECRET.encode()).hexdigest())
-        self.assertFalse(payload["has_other"])
-        self.assertFalse(payload["has_bws"])
+        for call in self.calls():
+            self.assertNotIn("UNRELATED_SECRET", call["env_names"])
+            self.assertIn("BWS_ACCESS_TOKEN", call["env_names"])
 
-        audit_text = (self.state_dir / "audit" / "audit.jsonl").read_text(encoding="utf-8")
-        self.assertIn(Path(sys.executable).name, audit_text)
-        self.assertNotIn(str(child), audit_text)
-        self.assertNotIn(SECRET, audit_text)
-        self.assertNotIn(BWS_TOKEN, audit_text)
+    def test_unknown_profile_fails_before_provider_call(self) -> None:
+        result = self.run_cli("run", "missing", "--", "true")
+        self.assertEqual(result.returncode, cli.EXIT_CONFIG)
+        self.assertEqual(self.calls(), [])
 
-    def test_remote_missing_deletes_whole_profile_cache(self):
-        self.assertEqual(self.run_cli("refresh", "github").returncode, 0)
-        self.bws_data.write_text("{}", encoding="utf-8")
+    def test_run_requires_argv_separator(self) -> None:
+        result = self.run_cli("run", "github", "true")
+        self.assertEqual(result.returncode, cli.EXIT_CONFIG)
+        self.assertEqual(self.calls(), [])
 
-        result = self.run_cli("refresh", "github")
+    def test_unknown_field_is_rejected(self) -> None:
+        self.write_config("schema_version = 1\nunknown = true\n[profiles]\n")
+        result = self.run_cli("doctor")
+        self.assertEqual(result.returncode, cli.EXIT_CONFIG)
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assert_secret_absent(result)
-        self.assertFalse((self.state_dir / "cache" / "github.json").exists())
-
-    def test_remote_unavailable_preserves_unexpired_profile_cache(self):
-        self.assertEqual(self.run_cli("refresh", "github").returncode, 0)
-        self.bws_unavailable.touch()
-
-        result = self.run_cli("refresh", "github")
-
-        self.assertEqual(result.returncode, 4)
-        self.assert_secret_absent(result)
-        self.assertTrue((self.state_dir / "cache" / "github.json").exists())
-        offline = self.run_cli("exec", "github", "--offline", "--", "/bin/true")
-        self.assertEqual(offline.returncode, 0, offline.stderr)
-
-    def test_expired_cache_cannot_be_used_offline(self):
-        self.assertEqual(self.run_cli("refresh", "github").returncode, 0)
-        cache_file = self.state_dir / "cache" / "github.json"
-        cache = json.loads(cache_file.read_text(encoding="utf-8"))
-        cache["expires_at"] = "2000-01-01T00:00:00+00:00"
-        hashable = {key: value for key, value in cache.items() if key != "content_sha256"}
-        encoded = json.dumps(hashable, sort_keys=True, separators=(",", ":")).encode()
-        cache["content_sha256"] = hashlib.sha256(encoded).hexdigest()
-        cache_file.write_text(json.dumps(cache), encoding="utf-8")
-        cache_file.chmod(0o600)
-
-        result = self.run_cli("exec", "github", "--offline", "--", "/bin/true")
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("expired", result.stderr.lower())
-        self.assert_secret_absent(result)
-
-    def test_unknown_config_field_fails_closed(self):
-        with self.config.open("a", encoding="utf-8") as handle:
-            handle.write("unknown_field: true\n")
-
-        result = self.run_cli("status", "github", "--json")
-
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("unknown", result.stderr.lower())
-        self.assert_secret_absent(result)
-
-    def test_profile_name_cannot_escape_cache_directory(self):
-        config_text = self.config.read_text(encoding="utf-8")
-        config_text = config_text.replace("  github:\n", "  ../escape:\n", 1)
-        self.config.write_text(config_text, encoding="utf-8")
-
-        result = self.run_cli("status", "../escape", "--json")
-
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("profile name", result.stderr.lower())
-        self.assert_secret_absent(result)
-
-    def test_target_environment_variable_must_be_a_safe_identifier(self):
-        config_text = self.config.read_text(encoding="utf-8")
-        config_text = config_text.replace("env: GH_TOKEN", "env: PATH", 1)
-        self.config.write_text(config_text, encoding="utf-8")
-
-        result = self.run_cli("refresh", "github")
-
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("environment variable", result.stderr.lower())
-        self.assert_secret_absent(result)
-
-    def test_bws_secret_id_must_be_a_uuid(self):
-        config_text = self.config.read_text(encoding="utf-8")
-        config_text = config_text.replace(
-            "id: 486c3235-2cb1-465d-9971-6997efdceb43",
-            "id: bitwarden-server",
-            1,
+    def test_invalid_uuid_is_rejected(self) -> None:
+        self.write_config(
+            'schema_version = 1\n[[profiles.bad]]\nid = "not-a-uuid"\nexpected_key = "KEY"\nenv = "TOKEN"\n'
         )
-        self.config.write_text(config_text, encoding="utf-8")
+        result = self.run_cli("doctor")
+        self.assertEqual(result.returncode, cli.EXIT_CONFIG)
+        self.assertEqual(self.calls(), [])
 
-        result = self.run_cli("refresh", "github")
-
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("secret id", result.stderr.lower())
-        self.assert_secret_absent(result)
-
-    def test_bws_provider_receives_bootstrap_token_but_not_other_managed_secrets(self):
-        env = self.base_env.copy()
-        env["OTHER_SECRET"] = "stale-other-secret"
-
-        result = self.run_cli("refresh", "github", env=env)
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assert_secret_absent(result)
-
-    def test_cache_integrity_failure_blocks_execution(self):
-        self.assertEqual(self.run_cli("refresh", "github").returncode, 0)
-        cache_file = self.state_dir / "cache" / "github.json"
-        cache_file.write_text('{"tampered":true}\n', encoding="utf-8")
-        cache_file.chmod(0o600)
-
-        result = self.run_cli("exec", "github", "--offline", "--", "/bin/true")
-
-        self.assertEqual(result.returncode, 5)
-        self.assertIn("cache", result.stderr.lower())
-        self.assert_secret_absent(result)
-
-    def test_insecure_token_permissions_fail_closed(self):
-        self.token_file.chmod(0o644)
-
-        result = self.run_cli("refresh", "github")
-
-        self.assertEqual(result.returncode, 6)
-        self.assertIn("permissions", result.stderr.lower())
-        self.assert_secret_absent(result)
-
-    def test_insecure_existing_state_directory_fails_closed(self):
-        self.state_dir.mkdir(mode=0o755)
-        self.state_dir.chmod(0o755)
-
-        result = self.run_cli("refresh", "github")
-
-        self.assertEqual(result.returncode, 6)
-        self.assertIn("permissions", result.stderr.lower())
-        self.assertEqual(stat.S_IMODE(self.state_dir.stat().st_mode), 0o755)
-        self.assert_secret_absent(result)
-
-    def test_github_validator_marks_refreshed_cache_verified_without_leaking_token(self):
-        config_text = self.config.read_text(encoding="utf-8")
-        config_text = config_text.replace("validator: none", "validator: github", 1)
-        config_text += f"gh_path: {self.fake_gh}\n"
-        self.config.write_text(config_text, encoding="utf-8")
-
-        result = self.run_cli("refresh", "github")
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assert_secret_absent(result)
-        snapshot = json.loads(
-            (self.state_dir / "cache" / "github.json").read_text(encoding="utf-8")
+    def test_duplicate_environment_is_rejected(self) -> None:
+        self.write_config(
+            f'schema_version = 1\n[[profiles.bad]]\nid = "{ID_ONE}"\nexpected_key = "A"\nenv = "TOKEN"\n'
+            f'[[profiles.bad]]\nid = "{ID_TWO}"\nexpected_key = "B"\nenv = "TOKEN"\n'
         )
-        self.assertEqual(snapshot["status"], "verified")
-        self.assertNotIn(SECRET, self.fake_gh_log.read_text(encoding="utf-8"))
+        result = self.run_cli("doctor")
+        self.assertEqual(result.returncode, cli.EXIT_CONFIG)
 
-    def test_github_validator_failure_keeps_cache_but_blocks_exec(self):
-        config_text = self.config.read_text(encoding="utf-8")
-        config_text = config_text.replace("validator: none", "validator: github", 1)
-        config_text += f"gh_path: {self.fake_gh}\n"
-        self.config.write_text(config_text, encoding="utf-8")
-        self.fake_gh.write_text("#!/bin/sh\nexit 4\n", encoding="utf-8")
-        self.fake_gh.chmod(0o700)
-
-        result = self.run_cli("refresh", "github")
-
-        self.assertEqual(result.returncode, 7)
-        self.assert_secret_absent(result)
-        self.assertTrue((self.state_dir / "cache" / "github.json").exists())
-        snapshot = json.loads(
-            (self.state_dir / "cache" / "github.json").read_text(encoding="utf-8")
+    def test_reserved_environment_is_rejected(self) -> None:
+        self.write_config(
+            f'schema_version = 1\n[[profiles.bad]]\nid = "{ID_ONE}"\nexpected_key = "A"\nenv = "PATH"\n'
         )
-        self.assertEqual(snapshot["status"], "unverified")
-        blocked = self.run_cli("exec", "github", "--offline", "--", "/bin/true")
-        self.assertEqual(blocked.returncode, 5)
+        result = self.run_cli("doctor")
+        self.assertEqual(result.returncode, cli.EXIT_CONFIG)
 
-    def test_setup_git_passes_only_host_and_force_to_gh(self):
-        config_text = self.config.read_text(encoding="utf-8")
-        config_text += f"gh_path: {self.fake_gh}\n"
-        self.config.write_text(config_text, encoding="utf-8")
+    def test_unsafe_config_permissions_are_rejected(self) -> None:
+        self.config.chmod(0o644)
+        result = self.run_cli("doctor")
+        self.assertEqual(result.returncode, cli.EXIT_PERMISSION)
 
-        result = self.run_cli("setup-git", "--hostname", "github.com")
+    def test_unsafe_directory_permissions_are_rejected(self) -> None:
+        self.config_dir.chmod(0o755)
+        result = self.run_cli("doctor")
+        self.assertEqual(result.returncode, cli.EXIT_PERMISSION)
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assert_secret_absent(result)
-        self.assertEqual(
-            json.loads(self.fake_gh_log.read_text(encoding="utf-8")),
-            ["auth", "setup-git", "--hostname", "github.com", "--force"],
-        )
+    def test_non_current_user_ownership_is_rejected(self) -> None:
+        with mock.patch.object(cli.os, "getuid", return_value=os.getuid() + 1):
+            with self.assertRaises(cli.ManagerError) as caught:
+                cli.load_config(self.config)
+        self.assertEqual(caught.exception.exit_code, cli.EXIT_PERMISSION)
 
-    @unittest.skipUnless(shutil.which("gh") and shutil.which("git"), "gh and git required")
-    def test_real_gh_credential_helper_uses_environment_token_without_persisting_it(self):
-        gh_path = shutil.which("gh")
-        isolated_home = self.root / "isolated-home"
-        gh_config = isolated_home / "gh"
-        isolated_home.mkdir(mode=0o700)
-        env = self.base_env.copy()
-        env.update(
-            {
-                "GH_CONFIG_DIR": str(gh_config),
-                "GH_TOKEN": SECRET,
-                "HOME": str(isolated_home),
-                "GIT_CONFIG_GLOBAL": str(isolated_home / ".gitconfig"),
-            }
-        )
+    def test_config_symlink_is_rejected(self) -> None:
+        real_config = self.root / "real.toml"
+        real_config.write_text(self.config.read_text(encoding="utf-8"), encoding="utf-8")
+        real_config.chmod(0o600)
+        self.config.unlink()
+        self.config.symlink_to(real_config)
+        result = self.run_cli("doctor")
+        self.assertEqual(result.returncode, cli.EXIT_PERMISSION)
 
-        credential = subprocess.run(
-            [gh_path, "auth", "git-credential", "get"],
-            input="protocol=https\nhost=github.com\n\n",
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(credential.returncode, 0, credential.stderr)
-        fields = dict(
-            line.split("=", 1)
-            for line in credential.stdout.splitlines()
-            if "=" in line
-        )
-        self.assertEqual(fields["username"], "x-access-token")
-        self.assertEqual(hashlib.sha256(fields["password"].encode()).hexdigest(), hashlib.sha256(SECRET.encode()).hexdigest())
-        self.assertFalse((gh_config / "hosts.yml").exists())
 
-        setup = subprocess.run(
-            [gh_path, "auth", "setup-git", "--hostname", "github.com", "--force"],
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(setup.returncode, 0, setup.stderr)
-        git_config = (isolated_home / ".gitconfig").read_text(encoding="utf-8")
-        self.assertIn("auth git-credential", git_config)
-        self.assertNotIn(SECRET, git_config)
-        self.assertFalse((gh_config / "hosts.yml").exists())
+class InstallerTestCase(unittest.TestCase):
+    def test_installer_produces_working_cli_without_installing_dependencies(self) -> None:
+        repo = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(dir="/tmp") as temp:
+            prefix = Path(temp) / "prefix"
+            result = subprocess.run(
+                ["bash", str(repo / "install.sh"), "--prefix", str(prefix)],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            smoke = subprocess.run(
+                [str(prefix / "bin" / "bit-secret-manager"), "--version"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(smoke.stdout.strip(), "bit-secret-manager 0.1.0")
 
 
 if __name__ == "__main__":

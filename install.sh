@@ -1,32 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# PROTOTYPE installer: installs a tested copy into the current user's home.
-project_root="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-install_root="${BIT_SECRET_HUB_INSTALL_ROOT:-$HOME/.local/lib/bit-secret-hub-prototype}"
-bin_root="${BIT_SECRET_HUB_BIN_ROOT:-$HOME/.local/bin}"
+PREFIX="$HOME/.local"
+if [[ "${1:-}" == "--prefix" && -n "${2:-}" && -z "${3:-}" ]]; then
+  PREFIX="$2"
+elif [[ $# -ne 0 ]]; then
+  echo "usage: ./install.sh [--prefix PATH]" >&2
+  exit 2
+fi
 
-for dependency in python3 bws gh git; do
-  if ! command -v "$dependency" >/dev/null 2>&1; then
-    echo "missing dependency: $dependency" >&2
-    exit 1
-  fi
-done
+python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' || {
+  echo "error: Python 3.11 or newer is required" >&2
+  exit 1
+}
 
-python3 -c 'import sys, yaml; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'
+SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$PREFIX/lib/bit-secret-manager"
+BIN_DIR="$PREFIX/bin"
 
-mkdir -p "$install_root" "$bin_root"
-chmod 700 "$install_root"
-cp -R "$project_root/bit_secret_hub" "$install_root/"
+install -d -m 0755 "$LIB_DIR" "$BIN_DIR"
+rm -rf "$LIB_DIR/bit_secret_manager"
+install -d -m 0755 "$LIB_DIR/bit_secret_manager"
+install -m 0644 "$SOURCE_DIR"/bit_secret_manager/*.py "$LIB_DIR/bit_secret_manager/"
+install -m 0755 "$SOURCE_DIR/bin/bit-secret-manager" "$BIN_DIR/bit-secret-manager"
 
-launcher="$bin_root/bit-secret-hub"
-temporary="${launcher}.tmp.$$"
-printf '%s\n' '#!/usr/bin/env bash' \
-  'set -euo pipefail' \
-  "export PYTHONPATH=\"$install_root\"" \
-  'exec python3 -m bit_secret_hub "$@"' >"$temporary"
-chmod 700 "$temporary"
-mv -f "$temporary" "$launcher"
-
-echo "installed prototype launcher: $launcher"
-
+echo "installed: $BIN_DIR/bit-secret-manager"
+echo "required separately: official bws CLI"

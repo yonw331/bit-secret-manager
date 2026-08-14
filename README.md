@@ -1,46 +1,77 @@
-# bit-secret-hub security prototype
+# bit-secret-manager
 
-> PROTOTYPE: this repository answers a security and state-model question. It is
-> not production-ready and is expected to be replaced after the model is proven.
+`bit-secret-manager` is a small WSL/Linux command-line tool that retrieves a
+configured Bitwarden Secrets Manager profile immediately before launching a
+process. BWS remains the only authority for business secret values. The manager
+does not cache values, create `.env` files, or contain provider-specific logic
+for GitHub or other consumers.
 
-The question is whether a personal secret manager can retrieve explicitly
-registered Bitwarden Secrets Manager values by ID, cache them per profile for
-seven days, and inject only the selected profile into a child process without
-placing values in command arguments, output, audit logs, or `gh` auth files.
+## Requirements
 
-## Proven surface
+- Linux or WSL
+- Python 3.11 or newer
+- The official `bws` executable on `PATH`
+- A separate read-only BWS Machine Account for each machine
 
-- Strict YAML configuration and explicit Secret ID mappings.
-- `refresh PROFILE` with per-file atomic replacement and `0600` cache files.
-- Base64 JSON cache with SHA-256 integrity metadata. Base64 is not encryption.
-- `status PROFILE --json` with no secret values.
-- `exec PROFILE [--offline] -- executable arg...` with managed-variable cleanup.
-- Optional GitHub validation through `gh api user`.
-- `setup-git --hostname github.com` using `gh auth setup-git --force`.
-- Value-free JSONL audit records.
+The accepted first-release risk is that machines may still read the same
+high-privilege, non-expiring GitHub PAT. This tool does not reduce that PAT's
+scope or remove its single-compromise blast radius.
 
-## Run
-
-Requirements: Linux or WSL2, Python 3.11+, PyYAML, `bws`, `gh`, and `git`.
+## Install
 
 ```bash
-python3 -m unittest discover -s tests -v
 ./install.sh
-bit-secret-hub --config ~/configs/config.yaml status github --json
+bit-secret-manager --version
 ```
 
-Use `config.example.yaml` only as a shape reference. `bw.env` must be a regular
-`0600` file containing exactly one line:
+The installer only copies the manager into `~/.local`. It does not install
+Python, `bws`, edit shell startup files, or create credentials.
 
-```dotenv
-BWS_ACCESS_TOKEN=replace-interactively-or-via-stdin
+## Configure
+
+Create `~/.config/bit-secret-manager/config.toml` with directory mode `0700`
+and file mode `0600`:
+
+```toml
+schema_version = 1
+
+[[profiles.github]]
+id = "<BWS Secret UUID>"
+expected_key = "GITHUB_PAT"
+env = "GH_TOKEN"
 ```
 
-Never commit `bw.env`, caches, audit output, device state, or real Secret IDs.
-The prototype intentionally does not implement `init`, `register`, `render`,
-`doctor`, `purge`, `decommission`, locking, release upgrade, Windows support, or
-Kubernetes delivery.
+Only Secret IDs, expected BWS keys, and target environment names belong in the
+configuration. Initialize this machine without putting its Token in argv:
 
-Open `prototype-cache-state.html` directly to exercise the state model without
-credentials or installation.
+```bash
+bit-secret-manager init
+bit-secret-manager doctor
+```
 
+For a trusted pipe, `init --token-stdin` reads exactly one line. The Token is
+stored as raw text in `access-token`; it is not a shell-sourceable file.
+
+Run consumers with an argv, not a shell string:
+
+```bash
+bit-secret-manager run github -- gh api user
+bit-secret-manager run github -- git push
+```
+
+Every mapping in the profile must be retrieved and identity-checked before the
+target starts. The target receives only the selected profile. It never receives
+`BWS_ACCESS_TOKEN`, and all managed variables are cleared before injection.
+
+Use `--config PATH` before the subcommand to select another private TOML file.
+
+## Verify
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+python3 -m compileall -q bit_secret_manager tests
+bash -n install.sh bin/bit-secret-manager
+```
+
+Tests use a fake `bws` and fake values; real credentials are neither needed nor
+accepted in fixtures.
