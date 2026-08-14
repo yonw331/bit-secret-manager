@@ -12,8 +12,10 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from typing import Any
+from typing import Any, Callable
 from uuid import UUID
+
+from . import __version__
 
 
 EXIT_CONFIG = 2
@@ -78,14 +80,7 @@ def ensure_private_file(path: Path, kind: str) -> None:
     private_stat(path, kind, 0o600)
 
 
-def load_config(path: Path) -> dict[str, Any]:
-    ensure_private_directory(path.parent)
-    ensure_private_file(path, "configuration file")
-    try:
-        with path.open("rb") as handle:
-            raw = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise ManagerError("cannot load configuration", EXIT_CONFIG) from exc
+def normalize_config(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ManagerError("configuration must be a table", EXIT_CONFIG)
     reject_unknown(raw, {"schema_version", "profiles"}, "configuration")
@@ -128,6 +123,17 @@ def load_config(path: Path) -> dict[str, Any]:
     return {"profiles": normalized, "managed_envs": managed_envs}
 
 
+def load_config(path: Path) -> dict[str, Any]:
+    ensure_private_directory(path.parent)
+    ensure_private_file(path, "configuration file")
+    try:
+        with path.open("rb") as handle:
+            raw = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise ManagerError("cannot load configuration", EXIT_CONFIG) from exc
+    return normalize_config(raw)
+
+
 def token_path_for(config_path: Path) -> Path:
     return config_path.parent / "access-token"
 
@@ -168,6 +174,145 @@ def atomic_write_token(path: Path, token: str) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def prompt_value(prompt: str, validator: Callable[[str], bool], error: str) -> str:
+    while True:
+        try:
+            value = input(prompt)
+        except (EOFError, KeyboardInterrupt) as exc:
+            raise ManagerError("initialization cancelled", EXIT_CONFIG) from exc
+        if not valid_utf8(value):
+            print("error: input must be valid UTF-8", file=sys.stderr)
+            continue
+        if validator(value):
+            return value
+        print(f"error: {error}", file=sys.stderr)
+
+
+def prompt_yes_no(prompt: str) -> bool:
+    while True:
+        answer = prompt_value(
+            prompt,
+            lambda value: value.lower() in {"", "y", "yes", "n", "no"},
+            "answer must be yes or no",
+        ).lower()
+        if answer in {"", "n", "no"}:
+            return False
+        return True
+
+
+def valid_uuid(value: str) -> bool:
+    try:
+        UUID(value)
+    except ValueError:
+        return False
+    return True
+
+
+def valid_utf8(value: str) -> bool:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def token_appears_duplicated(token: str) -> bool:
+    midpoint, remainder = divmod(len(token), 2)
+    return remainder == 0 and token[:midpoint] == token[midpoint:]
+
+
+def prompt_initial_config() -> dict[str, list[dict[str, str]]]:
+    profiles = {}
+    while True:
+        profile_name = prompt_value(
+            "Profile name: ",
+            lambda value: PROFILE_NAME_PATTERN.fullmatch(value) is not None and value not in profiles,
+            "profile name is unsafe or already exists",
+        )
+        mappings = []
+        while True:
+            secret_id = prompt_value("BWS Secret UUID: ", valid_uuid, "Secret ID must be a UUID")
+            expected_key = prompt_value(
+                "BWS Secret key (the Key field, not the UUID): ",
+                lambda value: bool(value) and value != secret_id,
+                "expected key must differ from the Secret UUID and not be empty",
+            )
+            mappings.append(
+                {
+                    "id": secret_id,
+                    "expected_key": expected_key,
+                    "env": prompt_value(
+                        "Target environment variable: ",
+                        lambda value: ENV_NAME_PATTERN.fullmatch(value) is not None
+                        and value not in RESERVED_ENV_NAMES
+                        and value not in {mapping["env"] for mapping in mappings},
+                        "environment variable is unsafe or already used",
+                    ),
+                }
+            )
+            if not prompt_yes_no("Add another mapping to this profile? [y/N]: "):
+                break
+        profiles[profile_name] = mappings
+        if not prompt_yes_no("Add another profile? [y/N]: "):
+            break
+    return profiles
+
+
+def serialize_config(profiles: dict[str, list[dict[str, str]]]) -> str:
+    lines = ["schema_version = 1", ""]
+    for profile_name, mappings in profiles.items():
+        for mapping in mappings:
+            lines.extend(
+                [
+                    f"[[profiles.{json.dumps(profile_name, ensure_ascii=False)}]]",
+                    f"id = {json.dumps(mapping['id'], ensure_ascii=False)}",
+                    f"expected_key = {json.dumps(mapping['expected_key'], ensure_ascii=False)}",
+                    f"env = {json.dumps(mapping['env'], ensure_ascii=False)}",
+                    "",
+                ]
+            )
+    content = "\n".join(lines)
+    if not valid_utf8(content):
+        raise ManagerError("cannot serialize configuration", EXIT_CONFIG)
+    try:
+        raw = tomllib.loads(content)
+    except tomllib.TOMLDecodeError as exc:
+        raise ManagerError("cannot serialize configuration", EXIT_CONFIG) from exc
+    normalize_config(raw)
+    return content
+
+
+def atomic_write_config(path: Path, content: str) -> None:
+    ensure_private_directory(path.parent, create=True)
+    if path.is_symlink():
+        raise ManagerError("configuration file may not be a symbolic link", EXIT_PERMISSION)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".config.toml.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def ensure_safe_missing_config_path(path: Path) -> None:
+    for directory in (path.parent, *path.parent.parents):
+        if directory.is_symlink():
+            raise ManagerError("configuration directory may not be a symbolic link", EXIT_PERMISSION)
+    if path.parent.exists():
+        ensure_private_directory(path.parent)
 
 
 def minimal_bws_environment(token: str) -> dict[str, str]:
@@ -214,16 +359,49 @@ def fetch_secret(executable: str, token: str, mapping: dict[str, str]) -> str:
 
 
 def init_command(config_path: Path, token_stdin: bool) -> int:
-    load_config(config_path)
+    config_exists = config_path.exists() or config_path.is_symlink()
+    if not config_exists:
+        ensure_safe_missing_config_path(config_path)
+    if token_stdin and not config_exists:
+        raise ManagerError(
+            "non-interactive init requires an existing configuration", EXIT_CONFIG
+        )
+    profiles = None
+    if config_exists:
+        load_config(config_path)
+    else:
+        profiles = prompt_initial_config()
     if token_stdin:
         token = sys.stdin.readline().rstrip("\n")
         if sys.stdin.readline() != "":
             raise ManagerError("stdin must contain exactly one Token line", EXIT_CONFIG)
     else:
-        token = getpass.getpass("BWS Machine Account Token: ")
+        try:
+            token = getpass.getpass("BWS Machine Account Token: ")
+        except (EOFError, KeyboardInterrupt) as exc:
+            raise ManagerError("initialization cancelled", EXIT_CONFIG) from exc
     if not token or "\n" in token or "\r" in token:
         raise ManagerError("Token must be one non-empty line", EXIT_CONFIG)
-    atomic_write_token(token_path_for(config_path), token)
+    if not valid_utf8(token):
+        raise ManagerError("Token must be valid UTF-8", EXIT_CONFIG)
+    if token_appears_duplicated(token):
+        raise ManagerError("Token appears to be duplicated; paste it once", EXIT_CONFIG)
+    if profiles is not None:
+        content = serialize_config(profiles)
+        config_written = False
+        try:
+            atomic_write_config(config_path, content)
+            config_written = True
+            atomic_write_token(token_path_for(config_path), token)
+        except Exception:
+            if config_written:
+                try:
+                    config_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
+    else:
+        atomic_write_token(token_path_for(config_path), token)
     print("credentials: initialized")
     return 0
 
@@ -276,7 +454,7 @@ def run_command(config_path: Path, profile_name: str, command: list[str]) -> int
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bit-secret-manager")
     parser.add_argument("--config", type=Path, default=DEFAULT_DIR / "config.toml")
-    parser.add_argument("--version", action="version", version="%(prog)s 0.1.0")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="action", required=True)
     init_parser = subparsers.add_parser("init")
     init_parser.add_argument("--token-stdin", action="store_true")
