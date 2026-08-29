@@ -686,6 +686,34 @@ class InstallerTestCase(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(smoke.stdout.strip(), "bit-secret-manager 0.3.0")
+            shortcut = prefix / "bin" / "bsm"
+            self.assertTrue(shortcut.is_symlink())
+            smoke = subprocess.run(
+                [str(shortcut), "--version"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(smoke.stdout.strip(), "bit-secret-manager 0.3.0")
+
+    def test_installer_refuses_to_replace_existing_bsm_command(self) -> None:
+        repo = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(dir="/tmp") as temp:
+            prefix = Path(temp) / "prefix"
+            bin_dir = prefix / "bin"
+            bin_dir.mkdir(parents=True)
+            existing = bin_dir / "bsm"
+            existing.write_text("existing command\n", encoding="utf-8")
+            result = subprocess.run(
+                ["bash", str(repo / "install.sh"), "--prefix", str(prefix)],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("refusing to replace", result.stderr)
+            self.assertEqual(existing.read_text(encoding="utf-8"), "existing command\n")
 
 
 class SchemaTwoCliTestCase(CliTestCase):

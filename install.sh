@@ -18,11 +18,18 @@ SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_DIR="$PREFIX/lib/bit-secret-manager"
 BIN_DIR="$PREFIX/bin"
 
+if [[ -e "$BIN_DIR/bsm" && ! -L "$BIN_DIR/bsm" ]]; then
+  echo "error: refusing to replace existing non-symlink command: $BIN_DIR/bsm" >&2
+  exit 1
+fi
+
 install -d -m 0755 "$LIB_DIR" "$BIN_DIR"
 rm -rf "$LIB_DIR/bit_secret_manager"
 install -d -m 0755 "$LIB_DIR/bit_secret_manager"
 install -m 0644 "$SOURCE_DIR"/bit_secret_manager/*.py "$LIB_DIR/bit_secret_manager/"
 install -m 0755 "$SOURCE_DIR/bin/bit-secret-manager" "$BIN_DIR/bit-secret-manager"
+ln -sfn bit-secret-manager "$BIN_DIR/bsm"
 
 echo "installed: $BIN_DIR/bit-secret-manager"
+echo "installed: $BIN_DIR/bsm"
 echo "required separately: official bws CLI"

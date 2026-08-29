@@ -21,11 +21,14 @@ state and supports BWS-only, local-only, and mixed profiles.
 ```bash
 ./install.sh
 bit-secret-manager --version
+bsm --version
 ```
 
-The installer writes `~/.local/bin/bit-secret-manager` and its Python package
-under `~/.local/lib/bit-secret-manager`. It does not install `bws`, alter shell
-startup, or create credentials.
+The installer writes `~/.local/bin/bit-secret-manager`, plus a `bsm` symbolic
+link to the same command, and its Python package under
+`~/.local/lib/bit-secret-manager`. It does not install `bws`, alter shell
+startup, or create credentials. Installation refuses to replace an existing
+non-symlink `~/.local/bin/bsm` command.
 
 ## Schema 2 Navigation
 
@@ -84,10 +87,10 @@ is deliberately no command to print, export, or delete a local value.
 After initialization, commands read the private device pointer:
 
 ```bash
-bit-secret-manager doctor
-bit-secret-manager doctor github
-bit-secret-manager run github -- gh api user
-bit-secret-manager run test-service -- ./test-client
+bsm doctor
+bsm doctor github
+bsm run github -- gh api user
+bsm run test-service -- ./test-client
 ```
 
 `doctor PROFILE` checks only that profile; `doctor` checks all profiles. BWS
