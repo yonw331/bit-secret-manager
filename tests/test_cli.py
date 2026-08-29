@@ -128,7 +128,7 @@ class CliTestCase(unittest.TestCase):
             return []
         return [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
 
-    def test_version_is_0_2_0(self) -> None:
+    def test_version_is_0_3_0(self) -> None:
         result = subprocess.run(
             [sys.executable, "-m", "bit_secret_manager", "--version"],
             env=self.env,
@@ -137,7 +137,7 @@ class CliTestCase(unittest.TestCase):
             check=False,
         )
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(result.stdout.strip(), "bit-secret-manager 0.2.0")
+        self.assertEqual(result.stdout.strip(), "bit-secret-manager 0.3.0")
 
     def test_init_from_stdin_writes_raw_token_atomically(self) -> None:
         self.token.unlink()
@@ -685,7 +685,293 @@ class InstallerTestCase(unittest.TestCase):
                 text=True,
                 check=False,
             )
-            self.assertEqual(smoke.stdout.strip(), "bit-secret-manager 0.2.0")
+            self.assertEqual(smoke.stdout.strip(), "bit-secret-manager 0.3.0")
+
+
+class SchemaTwoCliTestCase(CliTestCase):
+    LOCAL_VALUE = "local-value-never-print"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.private_dir = self.home / ".config" / "bit-secret-manager"
+        self.navigation = self.root / "navigation.toml"
+        self.env["HOME"] = str(self.home)
+
+    def write_navigation(self, entries: str) -> None:
+        self.navigation.write_text("schema_version = 2\n\n" + textwrap.dedent(entries), encoding="utf-8")
+        self.navigation.chmod(0o644)
+
+    def write_local_secrets(self, content: str | None = None) -> Path:
+        self.private_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        path = self.private_dir / "local-secrets.toml"
+        self.write_private(
+            path,
+            content
+            or 'schema_version = 1\n\n[secrets]\n"test-account" = "local-value-never-print"\n',
+        )
+        return path
+
+    def run_schema_cli(
+        self,
+        *args: str,
+        configured: bool = True,
+        env: dict[str, str] | None = None,
+        input_text: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        command = [sys.executable, "-m", "bit_secret_manager"]
+        if configured:
+            command.extend(["--config", str(self.navigation)])
+        command.extend(args)
+        return subprocess.run(command, input=input_text, env=env or self.env, capture_output=True, text=True, check=False)
+
+    def test_schema_two_pure_local_run_needs_no_bws_or_token(self) -> None:
+        self.write_navigation(
+            '''\
+            [[entries]]
+            profile = "local"
+            source = "local"
+            key = "test-account"
+            env = "LOCAL_TOKEN"
+            '''
+        )
+        self.write_local_secrets()
+        target = self.root / "target.py"
+        observed = self.root / "observed.json"
+        target.write_text(
+            "import json, os, sys\nfrom pathlib import Path\n"
+            "Path(sys.argv[1]).write_text(json.dumps({'local': os.getenv('LOCAL_TOKEN'), "
+            "'bws': os.getenv('BWS_ACCESS_TOKEN'), 'private': os.getenv('BIT_SECRET_MANAGER_LOCAL_SECRETS')}))\n",
+            encoding="utf-8",
+        )
+        env = self.env.copy()
+        env.update({"PATH": "/nonexistent", "BWS_ACCESS_TOKEN": "parent-token", "LOCAL_TOKEN": "stale"})
+
+        result = self.run_schema_cli("run", "local", "--", sys.executable, str(target), str(observed), env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(observed.read_text(encoding="utf-8")), {"local": self.LOCAL_VALUE, "bws": None, "private": None})
+        self.assertEqual(self.calls(), [])
+        self.assertNotIn(self.LOCAL_VALUE, result.stdout + result.stderr)
+
+    def test_schema_two_mixed_profile_is_atomic_when_local_key_is_missing(self) -> None:
+        self.write_navigation(
+            f'''\
+            [[entries]]
+            profile = "mixed"
+            source = "bws"
+            id = "{ID_ONE}"
+            expected_key = "GITHUB_PAT"
+            env = "GH_TOKEN"
+
+            [[entries]]
+            profile = "mixed"
+            source = "local"
+            key = "missing-local"
+            env = "LOCAL_TOKEN"
+            '''
+        )
+        self.write_local_secrets()
+        self.private_dir.joinpath("access-token").write_text(TOKEN + "\n", encoding="utf-8")
+        self.private_dir.joinpath("access-token").chmod(0o600)
+        marker = self.root / "started"
+
+        result = self.run_schema_cli("run", "mixed", "--", sys.executable, "-c", f"open({str(marker)!r}, 'w').close()")
+
+        self.assertEqual(result.returncode, cli.EXIT_CONFIG)
+        self.assertFalse(marker.exists())
+        self.assertNotIn(SECRET_ONE, result.stdout + result.stderr)
+        self.assertNotIn(self.LOCAL_VALUE, result.stdout + result.stderr)
+
+    def test_schema_two_init_writes_pointer_then_default_run_uses_it(self) -> None:
+        self.write_navigation(
+            f'''\
+            [[entries]]
+            profile = "bws"
+            source = "bws"
+            id = "{ID_ONE}"
+            expected_key = "GITHUB_PAT"
+            env = "GH_TOKEN"
+            '''
+        )
+
+        initialized = self.run_schema_cli("init", "--token-stdin", input_text=TOKEN + "\n")
+
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        pointer = self.private_dir / "device.toml"
+        self.assertEqual(stat.S_IMODE(pointer.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE((self.private_dir / "access-token").stat().st_mode), 0o600)
+        self.assertNotIn(TOKEN, initialized.stdout + initialized.stderr)
+        result = self.run_schema_cli("doctor", "bws", configured=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        target = self.root / "target.py"
+        observed = self.root / "observed.json"
+        target.write_text(
+            "import json, os, sys\nfrom pathlib import Path\n"
+            "Path(sys.argv[1]).write_text(json.dumps({'gh': os.getenv('GH_TOKEN'), 'bws': os.getenv('BWS_ACCESS_TOKEN')}))\n",
+            encoding="utf-8",
+        )
+        result = self.run_schema_cli("run", "bws", "--", sys.executable, str(target), str(observed), configured=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(observed.read_text(encoding="utf-8")), {"gh": SECRET_ONE, "bws": None})
+
+    def test_schema_two_mixed_profile_injects_both_values_after_full_resolution(self) -> None:
+        self.write_navigation(
+            f'''\
+            [[entries]]
+            profile = "mixed"
+            source = "bws"
+            id = "{ID_ONE}"
+            expected_key = "GITHUB_PAT"
+            env = "GH_TOKEN"
+
+            [[entries]]
+            profile = "mixed"
+            source = "local"
+            key = "test-account"
+            env = "LOCAL_TOKEN"
+            '''
+        )
+        self.write_local_secrets()
+        self.private_dir.joinpath("access-token").write_text(TOKEN + "\n", encoding="utf-8")
+        self.private_dir.joinpath("access-token").chmod(0o600)
+        target = self.root / "target.py"
+        observed = self.root / "observed.json"
+        target.write_text(
+            "import json, os, sys\nfrom pathlib import Path\n"
+            "Path(sys.argv[1]).write_text(json.dumps({'gh': os.getenv('GH_TOKEN'), 'local': os.getenv('LOCAL_TOKEN'), 'bws': os.getenv('BWS_ACCESS_TOKEN')}))\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_schema_cli("run", "mixed", "--", sys.executable, str(target), str(observed))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(observed.read_text(encoding="utf-8")), {"gh": SECRET_ONE, "local": self.LOCAL_VALUE, "bws": None})
+        self.assertNotIn(SECRET_ONE, result.stdout + result.stderr)
+        self.assertNotIn(self.LOCAL_VALUE, result.stdout + result.stderr)
+
+    def test_schema_two_doctor_profile_isolates_other_sources(self) -> None:
+        self.write_navigation(
+            f'''\
+            [[entries]]
+            profile = "bws"
+            source = "bws"
+            id = "{ID_ONE}"
+            expected_key = "GITHUB_PAT"
+            env = "GH_TOKEN"
+
+            [[entries]]
+            profile = "local"
+            source = "local"
+            key = "test-account"
+            env = "LOCAL_TOKEN"
+            '''
+        )
+        self.write_local_secrets()
+        env = self.env.copy()
+        env["PATH"] = "/nonexistent"
+
+        local = self.run_schema_cli("doctor", "local", env=env)
+        all_profiles = self.run_schema_cli("doctor", env=env)
+
+        self.assertEqual(local.returncode, 0, local.stderr)
+        self.assertIn("profile.local.test-account: ok", local.stdout)
+        self.assertEqual(all_profiles.returncode, cli.EXIT_PERMISSION)
+        self.assertIn("Token file", all_profiles.stderr)
+
+    def test_schema_two_rejects_unknown_and_conflicting_fields_before_launch(self) -> None:
+        self.write_navigation(
+            '''\
+            [[entries]]
+            profile = "bad"
+            source = "local"
+            key = "test-account"
+            id = "not-used"
+            env = "LOCAL_TOKEN"
+            '''
+        )
+        self.write_local_secrets()
+        marker = self.root / "started"
+
+        result = self.run_schema_cli("run", "bad", "--", sys.executable, "-c", f"open({str(marker)!r}, 'w').close()")
+
+        self.assertEqual(result.returncode, cli.EXIT_CONFIG)
+        self.assertFalse(marker.exists())
+        self.assertIn("unknown profile bad field", result.stderr)
+
+    def test_schema_two_rejects_duplicate_environment_before_launch(self) -> None:
+        self.write_navigation(
+            '''\
+            [[entries]]
+            profile = "bad"
+            source = "local"
+            key = "first"
+            env = "LOCAL_TOKEN"
+
+            [[entries]]
+            profile = "bad"
+            source = "local"
+            key = "second"
+            env = "LOCAL_TOKEN"
+            '''
+        )
+        marker = self.root / "started"
+
+        result = self.run_schema_cli("run", "bad", "--", sys.executable, "-c", f"open({str(marker)!r}, 'w').close()")
+
+        self.assertEqual(result.returncode, cli.EXIT_CONFIG)
+        self.assertFalse(marker.exists())
+        self.assertIn("duplicate environment variable", result.stderr)
+
+    def test_set_local_uses_hidden_input_rotation_and_private_file(self) -> None:
+        with mock.patch.object(cli, "DEFAULT_DIR", self.private_dir), mock.patch.object(getpass, "getpass", return_value=self.LOCAL_VALUE):
+            result = cli.main(["set-local", "test-account"])
+        path = self.private_dir / "local-secrets.toml"
+        self.assertEqual(result, 0)
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(cli.load_local_secrets(path), {"test-account": self.LOCAL_VALUE})
+        with mock.patch.object(cli, "DEFAULT_DIR", self.private_dir), mock.patch.object(getpass, "getpass", return_value="rotated-local-value"):
+            result = cli.main(["set-local", "test-account"])
+        self.assertEqual(result, 0)
+        self.assertEqual(cli.load_local_secrets(path), {"test-account": "rotated-local-value"})
+        self.assertEqual(list(self.private_dir.glob(".local-secrets.toml.*")), [])
+
+    def test_set_local_write_failure_preserves_old_value_and_cleans_temporary_file(self) -> None:
+        path = self.write_local_secrets()
+        with (
+            mock.patch.object(cli, "DEFAULT_DIR", self.private_dir),
+            mock.patch.object(getpass, "getpass", return_value="rotated-local-value"),
+            mock.patch.object(cli.os, "replace", side_effect=OSError("simulated failure")),
+        ):
+            with self.assertRaises(cli.ManagerError) as caught:
+                cli.set_local_command("test-account")
+
+        self.assertEqual(caught.exception.exit_code, cli.EXIT_PERMISSION)
+        self.assertEqual(cli.load_local_secrets(path), {"test-account": self.LOCAL_VALUE})
+        self.assertEqual(list(self.private_dir.glob(".local-secrets.toml.*")), [])
+
+    def test_local_secret_symlink_is_rejected_without_target_launch(self) -> None:
+        self.write_navigation(
+            '''\
+            [[entries]]
+            profile = "local"
+            source = "local"
+            key = "test-account"
+            env = "LOCAL_TOKEN"
+            '''
+        )
+        self.private_dir.mkdir(parents=True, mode=0o700)
+        outside = self.root / "outside"
+        outside.write_text("unchanged", encoding="utf-8")
+        (self.private_dir / "local-secrets.toml").symlink_to(outside)
+        marker = self.root / "started"
+
+        result = self.run_schema_cli("run", "local", "--", sys.executable, "-c", f"open({str(marker)!r}, 'w').close()")
+
+        self.assertEqual(result.returncode, cli.EXIT_PERMISSION)
+        self.assertFalse(marker.exists())
+        self.assertEqual(outside.read_text(encoding="utf-8"), "unchanged")
 
 
 if __name__ == "__main__":

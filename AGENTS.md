@@ -1,22 +1,25 @@
 # bit-secret-manager
 
 This repository contains the long-lived WSL/Linux manager. The active Vault
-iteration is `01-Projects/bit-secret-manager-init-wizard/Project.md` in the
-`ob-garden` repository; its PRD is the requirement source, GitHub Issue #1 is
-the task source, and this repository is the code source. The stable system
-entry is `03-Areas/技术成长/运维工程/系统-bit-secret-manager.md`.
+iteration is `01-Projects/260827-bit-secret-manager双源凭证升级/Project.md` in
+the `ob-garden` repository; its PRD is the requirement source, GitHub Issue #3
+is the task source, and this repository is the code source. The stable system
+entry is `03-Areas/技术成长/系统-bit-secret-manager.md`.
 
-Keep the public surface limited to `init`, `doctor`, and `run`. BWS is the only
-authority for secret values. Preserve execution-time retrieval, whole-profile
-success before launch, minimal BWS environment, child environment cleanup,
-strict TOML validation, value-free output, and fail-closed `0700`/`0600`
-ownership checks. Never add caches, `.env` generation, shell evaluation, Token
-arguments, or consumer-specific validation.
+Keep the public surface limited to `init`, `set-local`, `doctor`, and `run`.
+BWS remains the authority for BWS entries; local entries are device-private
+values used only at execution time. Preserve whole-profile success before
+launch, minimal BWS environment, child environment cleanup, strict TOML
+validation, value-free output, and fail-closed `0700`/`0600` ownership checks
+for private state. Never add caches, `.env` generation, shell evaluation,
+Token arguments, value-reading interfaces, or consumer-specific validation.
 
-`init` owns first-use configuration. With no configuration, interactive `init`
-collects all non-secret mappings before hidden Token input and commits private
-files only after validation. With an existing configuration, it only rotates
-the Token. `init --token-stdin` requires an existing configuration.
+Schema 1 private configurations remain readable only through explicit
+`--config`. Schema 2 navigation configuration contains no values and is read
+from the Vault; `init --config PATH` records its private device pointer and
+initializes a Token only when the configuration contains BWS entries.
+`set-local KEY` writes one hidden-input local value atomically. Do not add a
+value export, deletion, or migration command.
 
 After behavior changes run:
 
